@@ -1,0 +1,607 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  detect-ai-content
+
+  SAM Template for the AI Content Detector (AWS CB Hackathon, 2023-06)
+
+Parameters:
+  DetectFunctionReserved:
+    Description: Reserved Concurrency Limit for Detect Function
+    Default: 3
+    Type: Number
+  DetectFunctionProvisioned:
+    Description: Provisioned Concurrency Limit for Detect Function
+    Default: 3
+    Type: Number
+  ChunkFunctionReserved:
+    Description: Reserved Concurrency Limit for the Chunk Function
+    Default: 1
+    Type: Number
+  ChunkFunctionProvisioned:
+    Description: Provisioned Concurrency Limit for the Chunk Function
+    Default: 1
+    Type: Number
+
+Globals:
+  Function:
+    Timeout: 3
+    MemorySize: 128
+
+Resources:
+  #
+  # API Gateway Resources
+  #
+
+  RestApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      TracingEnabled: true
+      DefinitionBody:
+        'Fn::Transform':
+          Name: 'AWS::Include'
+          Parameters:
+            Location: src/stepfunction/api.yml
+
+  ApiGatewayStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+       - !Ref ApiGatewayStepFunctionsRolePolicy
+
+  ApiGatewayStepFunctionsRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CallLambdaFunctions
+            Effect: Allow
+            Action:
+            - states:StartExecution
+            - states:StartSyncExecution
+            Resource:
+            - !GetAtt ProcessStateMachine.Arn
+          - Sid: AccessCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            - logs:GetLogEvents
+            - logs:FilterLogEvents
+            # FIX: Permissions for wildcard
+            Resource: "*"
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - '-'
+        - - !Ref RestApiGateway
+          - "logs"
+
+  #
+  # Lambda Function Resources
+  #
+
+  DetectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: analyze.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      Timeout: 60
+      MemorySize: 2048
+      Tracing: Active
+      Environment:
+        Variables:
+          PATH: /mnt/efs/packages:/var/task:/opt/python/lib/python3.9/site-packages:/opt/python:/var/runtime:/var/lang/lib/python39.zip:/var/lang/lib/python3.9:/var/lang/lib/python3.9/lib-dynload:/var/lang/lib/python3.9/site-packages:/opt/python/lib/python3.9/site-packages:/opt/python
+          TRANSFORMERS_CACHE: /mnt/efs/hf_cache
+          XDG_CACHE_HOME: /tmp
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt VPC.DefaultSecurityGroup
+        SubnetIds:
+          - !Ref VPCPrivateSubnetA
+          - !Ref VPCPrivateSubnetB
+          - !Ref VPCPrivateSubnetC
+      FileSystemConfigs:
+        - Arn: !GetAtt AccessPoint.Arn
+          LocalMountPath: /mnt/efs
+      AutoPublishAlias: prod
+      ReservedConcurrentExecutions: !Ref DetectFunctionReserved
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: !Ref DetectFunctionProvisioned
+      Policies:
+      - Statement:
+        - Sid: CloudWatchLogsWrite
+          Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+        - Sid: VPCAccess
+          Effect: Allow
+          Action:
+            - ec2:CreateNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+          Resource: "*"
+        - Sid: EFSAccess
+          Effect: Allow
+          Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientRootAccess
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:DescribeMountTargets
+          Resource: "*"
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+      - MountTargetC
+  
+  ChunkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: chunk_smart.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Architectures:
+        - x86_64
+      Timeout: 60
+      MemorySize: 2048
+      Environment:
+        Variables:
+          PATH: /mnt/efs/packages:/var/task:/opt/python/lib/python3.9/site-packages:/opt/python:/var/runtime:/var/lang/lib/python39.zip:/var/lang/lib/python3.9:/var/lang/lib/python3.9/lib-dynload:/var/lang/lib/python3.9/site-packages:/opt/python/lib/python3.9/site-packages:/opt/python
+          TRANSFORMERS_CACHE: /mnt/efs/hf_cache
+          XDG_CACHE_HOME: /tmp
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt VPC.DefaultSecurityGroup
+        SubnetIds:
+          - !Ref VPCPrivateSubnetA
+          - !Ref VPCPrivateSubnetB
+          - !Ref VPCPrivateSubnetC
+      FileSystemConfigs:
+        - Arn: !GetAtt AccessPoint.Arn
+          LocalMountPath: /mnt/efs
+      AutoPublishAlias: prod
+      ReservedConcurrentExecutions: !Ref ChunkFunctionReserved
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: !Ref ChunkFunctionProvisioned
+      Policies:
+      - Statement:
+        - Sid: CloudWatchLogsWrite
+          Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+        - Sid: VPCAccess
+          Effect: Allow
+          Action:
+            - ec2:CreateNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+          Resource: "*"
+        - Sid: EFSAccess
+          Effect: Allow
+          Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientRootAccess
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:DescribeMountTargets
+          Resource: "*"
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+      - MountTargetC
+
+  DownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: download.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      Timeout: 30
+      Tracing: Active
+      Layers:
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p39-beautifulsoup4:6
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p39-requests:14
+      Policies:
+      - Statement:
+        - Sid: CloudWatchLogsWrite
+          Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+  
+  HashFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: hash.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Architectures:
+        - x86_64
+      Timeout: 30
+
+  AggregateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: aggregate.lambda_handler
+      Runtime: python3.9
+      Tracing: Active
+      Architectures:
+        - x86_64
+      Timeout: 30
+
+  TestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/
+      Handler: test.lambda_handler
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+  
+  #
+  # EFS Resources
+  #
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "elasticfilesystem:ClientMount"
+              - "elasticfilesystem:ClientWrite"
+            Principal:
+              AWS: "*"
+  
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref VPCPublicSubnetA
+      SecurityGroups:
+        - !GetAtt VPC.DefaultSecurityGroup
+  
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref VPCPublicSubnetB
+      SecurityGroups:
+        - !GetAtt VPC.DefaultSecurityGroup
+  
+  MountTargetC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref VPCPublicSubnetC
+      SecurityGroups:
+        - !GetAtt VPC.DefaultSecurityGroup
+  
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: "0777"
+        Path: /lambda
+  
+  #
+  # Step Functions Resources
+  #
+
+  ProcessStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: src/stepfunction/definition.asl.json
+      DefinitionSubstitutions:
+        CacheDynamoDbTable: !Select [1, !Split ['/', !GetAtt CacheTable.Arn]]
+        DetectLambdaFunction: !Join
+          - ""
+          - - !GetAtt DetectFunction.Arn
+            - ":prod"
+        HashLambdaFunction: !Join
+          - ""
+          - - !GetAtt HashFunction.Arn
+            - ":$LATEST"
+        DownloadLambdaFunction: !Join
+          - ""
+          - - !GetAtt DownloadFunction.Arn
+            - ":$LATEST"
+        ChunkLambdaFunction: !Join
+          - ""
+          - - !GetAtt ChunkFunction.Arn
+            - ":prod"
+        AggregateLambdaFunction: !Join
+          - ""
+          - - !GetAtt AggregateFunction.Arn
+            - ":$LATEST"
+      Type: EXPRESS
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ProcessStateMachineLogGroup.Arn
+      Tracing:
+        Enabled: true
+      Role: !GetAtt StateMachineRole.Arn
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+       - !Ref StateMachineRolePolicy
+
+  StateMachineRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CallLambdaFunctions
+            Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !GetAtt DetectFunction.Arn
+            - !Join
+              - ""
+              - - !GetAtt DetectFunction.Arn
+                - ":*"
+            - !GetAtt HashFunction.Arn
+            - !Join
+              - ""
+              - - !GetAtt HashFunction.Arn
+                - ":*"
+            - !GetAtt DownloadFunction.Arn
+            - !Join
+              - ""
+              - - !GetAtt DownloadFunction.Arn
+                - ":*"
+            - !GetAtt ChunkFunction.Arn
+            - !Join
+              - ""
+              - - !GetAtt ChunkFunction.Arn
+                - ":*"
+            - !GetAtt AggregateFunction.Arn
+            - !Join
+              - ""
+              - - !GetAtt AggregateFunction.Arn
+                - ":*"
+          - Sid: AccessDynamoDbTable
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:Query
+            Resource:
+            - !GetAtt CacheTable.Arn
+          - Sid: WriteCloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogDelivery
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DeleteLogDelivery
+            - logs:DescribeLogGroups
+            - logs:DescribeResourcePolicies
+            - logs:ListLogDeliveries
+            - logs:GetLogDelivery
+            - logs:PutLogEvents
+            - logs:PutResourcePolicy
+            - logs:UpdateLogDelivery
+            Resource: "*"
+            # FIX: Removing wildcard permissions for logging
+            #- !GetAtt ProcessStateMachineLogGroup.Arn
+
+  ProcessStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}-Logs
+
+  #
+  # DynamoDB Resources
+  #
+
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: HashValue
+          AttributeType: S
+      KeySchema:
+        - AttributeName: HashValue
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+  
+  #
+  # VPC Resources (for supporting the EFS Volume)
+  #
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  VPCPublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.0.64.0/24
+  
+  VPCPublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.0.65.0/24
+  
+  VPCPublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1c
+      CidrBlock: 10.0.66.0/24
+
+  VPCPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.0.128.0/24
+  
+  VPCPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.0.129.0/24
+  
+  VPCPrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: us-east-1c
+      CidrBlock: 10.0.130.0/24
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: NATGatewayEIP
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref VPCPublicSubnetA
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  SubnetAPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref VPCPublicSubnetA
+  
+  SubnetBPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref VPCPublicSubnetB
+
+  SubnetCPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref VPCPublicSubnetC
+
+  SubnetAPrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref VPCPrivateSubnetA
+  
+  SubnetBPrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref VPCPrivateSubnetB
+
+  SubnetCPrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref VPCPrivateSubnetC
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NATGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+
+Outputs:
+  RunApi:
+    Description: "API Gateway Step Function Invocation URL"
+    Value: !Sub "https://${RestApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/run/"
+  EfsArn:
+    Description: "ARN of the EFS File System for use with package deployment"
+    Value: !GetAtt EFSFileSystem.Arn

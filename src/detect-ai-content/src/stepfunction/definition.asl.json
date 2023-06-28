@@ -1,0 +1,264 @@
+{
+  "Comment": "Orchestrates the process of detecting if content is AI-generated",
+  "StartAt": "Input Type",
+  "States": {
+    "Input Type": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.url",
+          "IsPresent": true,
+          "Comment": "`url` present",
+          "Next": "Download File from Path"
+        },
+        {
+          "Variable": "$.payload",
+          "IsPresent": true,
+          "Comment": "`payload` present",
+          "Next": "Transform payload into input"
+        }
+      ],
+      "Default": "Fail"
+    },
+    "Transform payload into input": {
+      "Type": "Pass",
+      "Next": "Chunk Input",
+      "Parameters": {
+        "input.$": "$.payload"
+      }
+    },
+    "Fail": {
+      "Type": "Fail"
+    },
+    "Download File from Path": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${DownloadLambdaFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Chunk Input"
+    },
+    "Chunk Input": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${ChunkLambdaFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Foreach Chunk"
+    },
+    "Foreach Chunk": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "Rebuild Payload Structure",
+        "States": {
+          "Rebuild Payload Structure": {
+            "Type": "Pass",
+            "Next": "Generate Payload Hash",
+            "Parameters": {
+              "payload.$": "$"
+            }
+          },
+          "Generate Payload Hash": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "Payload.$": "$",
+              "FunctionName": "${HashLambdaFunction}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Check Cache"
+          },
+          "Check Cache": {
+            "Type": "Task",
+            "Parameters": {
+              "TableName": "${CacheDynamoDbTable}",
+              "KeyConditionExpression": "HashValue = :HashValue",
+              "ExpressionAttributeValues": {
+                ":HashValue": {
+                  "S.$": "$.hash"
+                }
+              }
+            },
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:query",
+            "ResultPath": "$.cacheCheck",
+            "Next": "Cache Hit?"
+          },
+          "Cache Hit?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.cacheCheck.Count",
+                "NumericGreaterThan": 0,
+                "Next": "Retrieve Cached Item",
+                "Comment": "Cache Hit"
+              }
+            ],
+            "Default": "Analyze Payload"
+          },
+          "Retrieve Cached Item": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:getItem",
+            "Parameters": {
+              "TableName": "${CacheDynamoDbTable}",
+              "Key": {
+                "HashValue": {
+                  "S.$": "$.hash"
+                }
+              }
+            },
+            "ResultPath": "$.Cache",
+            "Next": "Parse Cached Item"
+          },
+          "Parse Cached Item": {
+            "Type": "Pass",
+            "Parameters": {
+              "meta": {
+                "hash.$": "$.hash",
+                "cacheHit.$": "$.cacheCheck.Count"
+              },
+              "payload.$": "$.payload",
+              "label.$": "$.Cache.Item.Result.M.label.S",
+              "score.$": "$.Cache.Item.Result.M.score.N"
+            },
+            "End": true
+          },
+          "Analyze Payload": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "Payload.$": "$",
+              "FunctionName": "${DetectLambdaFunction}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
+            "ResultPath": "$.Result",
+            "Next": "Put Cache Item"
+          },
+          "Put Cache Item": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Parameters": {
+              "TableName": "${CacheDynamoDbTable}",
+              "Item": {
+                "HashValue": {
+                  "S.$": "$.hash"
+                },
+                "Result": {
+                  "M": {
+                    "label": {
+                      "S.$": "$.Result.Payload.label"
+                    },
+                    "score": {
+                      "N.$": "$.Result.Payload.score"
+                    }
+                  }
+                }
+              }
+            },
+            "ResultPath": "$.DynamoDB",
+            "Next": "Parse New Item"
+          },
+          "Parse New Item": {
+            "Type": "Pass",
+            "Parameters": {
+              "meta": {
+                "hash.$": "$.hash",
+                "cacheHit.$": "$.cacheCheck.Count"
+              },
+              "payload.$": "$.payload",
+              "label.$": "$.Result.Payload.label",
+              "score.$": "$.Result.Payload.score"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "Aggregate Results",
+      "ItemsPath": "$.chunks",
+      "MaxConcurrency": 3
+    },
+    "Aggregate Results": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${AggregateLambdaFunction}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+These are just some scrap bits of code I used while building the thing. They serve no purpose, but figured they could come along for the ride.

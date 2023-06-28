@@ -1,0 +1,49 @@
+---
+openapi: 3.0.1
+info:
+  title: ai-content-detector
+  version: 2023-06-28 05:02:29UTC
+paths:
+  /run:
+    post:
+      responses:
+        "200":
+          description: 200 response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Empty"
+      x-amazon-apigateway-integration:
+        type: aws
+        credentials:
+          Fn::Sub: ${ApiGatewayStepFunctionsRole.Arn}
+        httpMethod: POST
+        uri: arn:aws:apigateway:${AWS::Region}:states:action/StartSyncExecution
+        responses:
+          default:
+            statusCode: "200"
+            responseTemplates:
+              application/json: |-
+                #set ($parsedPayload = $util.parseJson($input.json('$.output')))
+                $parsedPayload
+        requestTemplates:
+          application/json:
+            Fn::Join:
+              - ""
+              - - |-
+                  #set($data = $util.escapeJavaScript($input.json('$')))
+                      {
+                          "input": "$data",
+                          "stateMachineArn": "
+                - Fn::GetAtt:
+                  - ProcessStateMachine
+                  - Arn
+                - |-
+                  "
+                      }
+        passthroughBehavior: when_no_templates
+components:
+  schemas:
+    Empty:
+      title: Empty Schema
+      type: object
